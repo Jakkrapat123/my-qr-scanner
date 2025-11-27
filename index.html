@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>2-Point QR Scanner (Standalone)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  
+
   <!-- html5-qrcode CDN -->
   <script src="https://unpkg.com/html5-qrcode"></script>
 
@@ -47,122 +47,176 @@ function setResult(txt, ok=true) {
 
 /* ===== SharePoint REST Helpers ===== */
 async function getRequestDigest() {
-  const resp = await fetch(`${siteUrl}/_api/contextinfo`, { method: "POST", headers: { "Accept":"application/json;odata=verbose" }});
-  const j = await resp.json();
-  return j.d.GetContextWebInformation.FormDigestValue;
+  const resp = await fetch(`${siteUrl}/_api/contextinfo`, {
+    method: "POST",
+    headers: { "Accept": "application/json;odata=verbose" }
+  });
+  const json = await resp.json();
+  return json.d.GetContextWebInformation.FormDigestValue;
 }
 
 async function getListEntityType() {
-  const resp = await fetch(`${siteUrl}/_api/web/lists/getbytitle('${listName}')?$select=ListItemEntityTypeFullName`, { headers: { "Accept":"application/json;odata=verbose" }});
-  const j = await resp.json();
-  return j.d.ListItemEntityTypeFullName;
+  const resp = await fetch(
+    `${siteUrl}/_api/web/lists/getbytitle('${listName}')?$select=ListItemEntityTypeFullName`,
+    { headers: { "Accept": "application/json;odata=verbose" }}
+  );
+  const json = await resp.json();
+  return json.d.ListItemEntityTypeFullName;
 }
 
 async function findItemByRecordID(recordID) {
   const filter = encodeURIComponent(`RecordID eq '${recordID}'`);
   const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items?$filter=${filter}&$top=1`;
   const resp = await fetch(url, { headers: { "Accept":"application/json;odata=verbose" }});
-  const j = await resp.json();
-  return (j.d.results && j.d.results.length>0) ? j.d.results[0] : null;
+  const json = await resp.json();
+
+  // ป้องกัน error "undefined is not an object" 
+  if (!json.d || !json.d.results) return null;
+
+  return json.d.results.length > 0 ? json.d.results[0] : null;
 }
 
 async function createItem(payload) {
   const digest = await getRequestDigest();
   const entityType = await getListEntityType();
   payload["__metadata"] = { "type": entityType };
-  const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items`;
-  const resp = await fetch(url, {
+
+  const resp = await fetch(`${siteUrl}/_api/web/lists/getbytitle('${listName}')/items`, {
     method: "POST",
     headers: {
-      "Accept":"application/json;odata=verbose",
-      "Content-Type":"application/json;odata=verbose",
+      "Accept": "application/json;odata=verbose",
+      "Content-Type": "application/json;odata=verbose",
       "X-RequestDigest": digest
     },
     body: JSON.stringify(payload)
   });
-  const j = await resp.json();
-  return j.d;
+
+  const json = await resp.json();
+  if (!json.d) throw new Error("Create response invalid.");
+
+  return json.d;
 }
 
 async function updateItem(itemId, payload) {
   const digest = await getRequestDigest();
   const entityType = await getListEntityType();
   payload["__metadata"] = { "type": entityType };
-  const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items(${itemId})`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Accept":"application/json;odata=verbose",
-      "Content-Type":"application/json;odata=verbose",
-      "X-RequestDigest": digest,
-      "IF-MATCH": "*",
-      "X-HTTP-Method": "MERGE"
-    },
-    body: JSON.stringify(payload)
-  });
+
+  const resp = await fetch(
+    `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items(${itemId})`,
+    {
+      method: "POST",
+      headers: {
+        "Accept": "application/json;odata=verbose",
+        "Content-Type": "application/json;odata=verbose",
+        "X-RequestDigest": digest,
+        "IF-MATCH": "*",
+        "X-HTTP-Method": "MERGE"
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+
   return resp.ok;
 }
 
 /* ===== Business Logic ===== */
 async function processScan(recordID, point) {
   setLatest(`${point} scanned: ${recordID} at ${nowISO()}`);
+
   try {
     const existing = await findItemByRecordID(recordID);
+
+    /* === CREATE CASE === */
     if (!existing) {
       const payload = {
         RecordID: recordID,
         Device: navigator.userAgent,
         UserID: "unknown"
       };
-      if (point === "A") { payload.ScanA=recordID; payload.ScanATime=nowISO(); payload.Status="PARTIAL"; }
-      else { payload.ScanB=recordID; payload.ScanBTime=nowISO(); payload.Status="PARTIAL"; }
+
+      if (point === "A") {
+        payload.ScanA = recordID;
+        payload.ScanATime = nowISO();
+      } else {
+        payload.ScanB = recordID;
+        payload.ScanBTime = nowISO();
+      }
+
+      payload.Status = "PARTIAL";
+
       const created = await createItem(payload);
       setResult(`Created record (ID ${created.Id})`, true);
-    } else {
-      const itemId = existing.Id;
-      const update = { Device: navigator.userAgent, UserID: "unknown" };
-      if (point === "A") { update.ScanA=recordID; update.ScanATime=nowISO(); }
-      else { update.ScanB=recordID; update.ScanBTime=nowISO(); }
-
-      const scanAVal = point==="A"?recordID:(existing.ScanA||"");
-      const scanBVal = point==="B"?recordID:(existing.ScanB||"");
-      if(scanAVal && scanBVal) {
-        update.Status="COMPLETE";
-        update.FinalTimestamp=nowISO();
-        update.Match=(scanAVal===scanBVal);
-      } else {
-        update.Status="PARTIAL";
-      }
-      const ok = await updateItem(itemId, update);
-      setResult(ok ? `Updated record ${itemId}` : `Update failed`, ok);
+      return;
     }
-  } catch(e) {
+
+    /* === UPDATE CASE === */
+    const itemId = existing.Id;
+    const update = {
+      Device: navigator.userAgent,
+      UserID: "unknown"
+    };
+
+    if (point === "A") {
+      update.ScanA = recordID;
+      update.ScanATime = nowISO();
+    } else {
+      update.ScanB = recordID;
+      update.ScanBTime = nowISO();
+    }
+
+    const finalA = update.ScanA || existing.ScanA || "";
+    const finalB = update.ScanB || existing.ScanB || "";
+
+    if (finalA && finalB) {
+      update.Status = "COMPLETE";
+      update.FinalTimestamp = nowISO();
+      update.Match = finalA === finalB;
+    } else {
+      update.Status = "PARTIAL";
+    }
+
+    const ok = await updateItem(itemId, update);
+    setResult(ok ? `Updated record ${itemId}` : `Update failed`, ok);
+
+  } catch (e) {
     console.error(e);
-    setResult("Error: "+e.message,false);
+    setResult("Error: " + e.message, false);
   }
 }
 
 /* ===== Scanner ===== */
-let scanner=null;
-async function startScanner(point){
+let scanner = null;
+async function startScanner(point) {
   setResult("Starting camera...", true);
-  if(scanner){ try{await scanner.clear(); }catch(e){} scanner=null; }
-  scanner = new Html5Qrcode("reader");
-  scanner.start(
-    { facingMode:"environment" },
-    { fps:10, qrbox:{width:300,height:200} },
-    qrCodeMessage=>{
-      processScan(qrCodeMessage.trim(), point);
-      scanner.stop();
-    },
-    errorMessage=>{}
-  ).catch(err=>{
-    setResult("Camera error: "+err,false);
-  });
+
+  try {
+    if (scanner) {
+      try { await scanner.clear(); } catch(e){}
+      scanner = null;
+    }
+
+    scanner = new Html5Qrcode("reader");
+
+    scanner.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: { width: 300, height: 200 } },
+      message => {
+        processScan(message.trim(), point);
+        scanner.stop();
+      },
+      error => {}
+    ).catch(err => {
+      setResult("Camera error: " + err, false);
+    });
+
+  } catch(e) {
+    setResult("Init error: " + e.message, false);
+  }
 }
 
-document.getElementById('btnA').addEventListener('click',()=>startScanner('A'));
-document.getElementById('btnB').addEventListener('click',()=>startScanner('B'));
+document.getElementById('btnA').addEventListener('click', () => startScanner('A'));
+document.getElementById('btnB').addEventListener('click', () => startScanner('B'));
 
 </script>
 </body>
