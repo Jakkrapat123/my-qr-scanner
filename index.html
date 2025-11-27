@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <title>2-Point QR Scanner (Standalone)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  
+  <!-- html5-qrcode CDN -->
+  <script src="https://unpkg.com/html5-qrcode"></script>
+
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    button { font-size: 18px; padding: 10px 16px; margin: 8px; }
+    #reader { width: 320px; margin-top: 10px; }
+    .big { font-size: 18px; font-weight: bold; }
+    #result { font-weight: bold; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h2>2-Point QR Scanner (A / B)</h2>
+
+  <div>
+    <label class="big">เลือกจุดสแกน</label><br/>
+    <button id="btnA">Scan Point A</button>
+    <button id="btnB">Scan Point B</button>
+  </div>
+
+  <div id="reader"></div>
+
+  <div style="margin-top:10px;">
+    <div>Latest: <span id="latest">-</span></div>
+    <div>Result: <span id="result">-</span></div>
+  </div>
+
+<script>
+/* ===== CONFIG ===== */
+const siteUrl = "https://luxotticagroup.sharepoint.com/sites/MetalPlating_ELTL";
+const listName = "QRScanLog";
+
+function nowISO() { return new Date().toISOString(); }
+function setLatest(txt) { document.getElementById('latest').innerText = txt; }
+function setResult(txt, ok=true) {
+  const el = document.getElementById('result');
+  el.innerText = txt;
+  el.style.color = ok ? "green" : "red";
+}
+
+/* ===== SharePoint REST Helpers ===== */
+async function getRequestDigest() {
+  const resp = await fetch(`${siteUrl}/_api/contextinfo`, { method: "POST", headers: { "Accept":"application/json;odata=verbose" }});
+  const j = await resp.json();
+  return j.d.GetContextWebInformation.FormDigestValue;
+}
+
+async function getListEntityType() {
+  const resp = await fetch(`${siteUrl}/_api/web/lists/getbytitle('${listName}')?$select=ListItemEntityTypeFullName`, { headers: { "Accept":"application/json;odata=verbose" }});
+  const j = await resp.json();
+  return j.d.ListItemEntityTypeFullName;
+}
+
+async function findItemByRecordID(recordID) {
+  const filter = encodeURIComponent(`RecordID eq '${recordID}'`);
+  const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items?$filter=${filter}&$top=1`;
+  const resp = await fetch(url, { headers: { "Accept":"application/json;odata=verbose" }});
+  const j = await resp.json();
+  return (j.d.results && j.d.results.length>0) ? j.d.results[0] : null;
+}
+
+async function createItem(payload) {
+  const digest = await getRequestDigest();
+  const entityType = await getListEntityType();
+  payload["__metadata"] = { "type": entityType };
+  const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Accept":"application/json;odata=verbose",
+      "Content-Type":"application/json;odata=verbose",
+      "X-RequestDigest": digest
+    },
+    body: JSON.stringify(payload)
+  });
+  const j = await resp.json();
+  return j.d;
+}
+
+async function updateItem(itemId, payload) {
+  const digest = await getRequestDigest();
+  const entityType = await getListEntityType();
+  payload["__metadata"] = { "type": entityType };
+  const url = `${siteUrl}/_api/web/lists/getbytitle('${listName}')/items(${itemId})`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Accept":"application/json;odata=verbose",
+      "Content-Type":"application/json;odata=verbose",
+      "X-RequestDigest": digest,
+      "IF-MATCH": "*",
+      "X-HTTP-Method": "MERGE"
+    },
+    body: JSON.stringify(payload)
+  });
+  return resp.ok;
+}
+
+/* ===== Business Logic ===== */
+async function processScan(recordID, point) {
+  setLatest(`${point} scanned: ${recordID} at ${nowISO()}`);
+  try {
+    const existing = await findItemByRecordID(recordID);
+    if (!existing) {
+      const payload = {
+        RecordID: recordID,
+        Device: navigator.userAgent,
+        UserID: "unknown"
+      };
+      if (point === "A") { payload.ScanA=recordID; payload.ScanATime=nowISO(); payload.Status="PARTIAL"; }
+      else { payload.ScanB=recordID; payload.ScanBTime=nowISO(); payload.Status="PARTIAL"; }
+      const created = await createItem(payload);
+      setResult(`Created record (ID ${created.Id})`, true);
+    } else {
+      const itemId = existing.Id;
+      const update = { Device: navigator.userAgent, UserID: "unknown" };
+      if (point === "A") { update.ScanA=recordID; update.ScanATime=nowISO(); }
+      else { update.ScanB=recordID; update.ScanBTime=nowISO(); }
+
+      const scanAVal = point==="A"?recordID:(existing.ScanA||"");
+      const scanBVal = point==="B"?recordID:(existing.ScanB||"");
+      if(scanAVal && scanBVal) {
+        update.Status="COMPLETE";
+        update.FinalTimestamp=nowISO();
+        update.Match=(scanAVal===scanBVal);
+      } else {
+        update.Status="PARTIAL";
+      }
+      const ok = await updateItem(itemId, update);
+      setResult(ok ? `Updated record ${itemId}` : `Update failed`, ok);
+    }
+  } catch(e) {
+    console.error(e);
+    setResult("Error: "+e.message,false);
+  }
+}
+
+/* ===== Scanner ===== */
+let scanner=null;
+async function startScanner(point){
+  setResult("Starting camera...", true);
+  if(scanner){ try{await scanner.clear(); }catch(e){} scanner=null; }
+  scanner = new Html5Qrcode("reader");
+  scanner.start(
+    { facingMode:"environment" },
+    { fps:10, qrbox:{width:300,height:200} },
+    qrCodeMessage=>{
+      processScan(qrCodeMessage.trim(), point);
+      scanner.stop();
+    },
+    errorMessage=>{}
+  ).catch(err=>{
+    setResult("Camera error: "+err,false);
+  });
+}
+
+document.getElementById('btnA').addEventListener('click',()=>startScanner('A'));
+document.getElementById('btnB').addEventListener('click',()=>startScanner('B'));
+
+</script>
+</body>
+</html>
